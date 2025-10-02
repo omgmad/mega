@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+// -------------------- ReentrancyGuard --------------------
+abstract contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+
+    constructor() { _status = _NOT_ENTERED; }
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+
+// -------------------- IERC20 --------------------
+interface IERC20 {
+    function totalSupply() external view returns(uint256);
+    function balanceOf(address account) external view returns(uint256);
+    function transfer(address recipient, uint256 amount) external returns(bool);
+    function allowance(address owner, address spender) external view returns(uint256);
+    function approve(address spender, uint256 amount) external returns(bool);
+    function transferFrom(address sender,address recipient,uint256 amount) external returns(bool);
+}
+
+// -------------------- ETBToken --------------------
+contract ETBToken is IERC20, ReentrancyGuard {
+
+    // ----------------------------
+    // ERC20 Standard variables
+    // ----------------------------
+    string public name = "ETB Token";
+    string public symbol = "ETB";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    uint256 public constant MAX_SUPPLY = 21_000_000 * 1e18;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowances;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner,address indexed spender,uint256 value);
+
+    // ----------------------------
+    // Ownership & Pausable
+    // ----------------------------
+    address public owner;
+    bool public paused = false;
+
+    modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
+    modifier whenNotPaused() { require(!paused, "Contract paused"); _; }
+
+    // ----------------------------
+    // Participation Mining
+    // ----------------------------
+    struct Stage {
+        uint256 startSupply;
+        uint256 endSupply;
+        uint256 rewardPerBlock;
+    }
+
+    Stage[] public stages;
+    uint256 public currentStage;
+    uint256 public mintedSupply;
+
+    uint256 public constant MIN_PARTICIPATION = 0.00001 ether;
+    uint256 public constant MAX_PARTICIPATION = 10 ether;
+
+    struct BlockInfo {
+        uint256 totalETH;
+        mapping(address => uint256) userETH;
+        bool rewardsClaimed;
+    }
+
+    mapping(uint256 => BlockInfo) public blocksInfo; // block.number -> BlockInfo
+    mapping(address => uint256) public pendingRewards; // хүлээгдэж байгаа reward
+
+    event Participated(address indexed user, uint256 ethAmount);
+    event RewardClaimed(address indexed user, uint256 amount);
+
+    // ----------------------------
+    // Constructor
+    // ----------------------------
+    constructor() {
+        owner = msg.sender;
+
+        // Halving stages: 21M хүртэл
+        stages.push(Stage(0, 10_500_000 * 1e18, 2 * 1e18));
+        stages.push(Stage(10_500_000 * 1e18, 15_750_000 * 1e18, 1 * 1e18));
+        stages.push(Stage(15_750_000 * 1e18, 18_375_000 * 1e18, 5 * 1e17));
+        stages.push(Stage(18_375_000 * 1e18, 19_687_500 * 1e18, 25 * 1e16));
+        stages.push(Stage(19_687_500 * 1e18, 20_343_750 * 1e18, 125 * 1e15));
+        stages.push(Stage(20_343_750 * 1e18, 21_000_000 * 1e18, 625 * 1e13));
+
+        currentStage = 0;
+
+        // Pre-mint initial liquidity reserve
+        uint256 initialLiquidity = 105_000 * 1e18;
+        balanceOf[address(this)] = initialLiquidity;
+        mintedSupply = initialLiquidity;
+        totalSupply += initialLiquidity;
+    }
+
+    // ----------------------------
+    // ERC20 functions
+    // ----------------------------
+    function transfer(address to, uint256 amount) external whenNotPaused returns(bool){
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external whenNotPaused returns(bool){
+        allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender,address recipient,uint256 amount) external whenNotPaused returns(bool){
+        require(balanceOf[sender] >= amount, "Insufficient balance");
+        require(allowances[sender][msg.sender] >= amount, "Allowance exceeded");
+
+        balanceOf[sender] -= amount;
+        balanceOf[recipient] += amount;
+        allowances[sender][msg.sender] -= amount;
+
+        emit Transfer(sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address ownerAddr,address spender) external view returns(uint256){
+        return allowances[ownerAddr][spender];
+    }
+
+    // ----------------------------
+    // Participation Mining
+    // ----------------------------
+    function participate() external payable whenNotPaused nonReentrant {
+        require(msg.value >= MIN_PARTICIPATION && msg.value <= MAX_PARTICIPATION, "ETH out of bounds");
+        require(currentStage < stages.length, "All stages completed");
+
+        uint256 blk = block.number;
+        BlockInfo storage b = blocksInfo[blk];
+
+        b.userETH[msg.sender] += msg.value;
+        b.totalETH += msg.value;
+
+        emit Participated(msg.sender, msg.value);
+    }
+
+    function claimReward(uint256 blk) external whenNotPaused nonReentrant {
+        BlockInfo storage b = blocksInfo[blk];
+        require(!b.rewardsClaimed, "Block reward already distributed");
+        require(b.totalETH > 0, "No ETH in block");
+
+        Stage memory stage = stages[currentStage];
+        uint256 totalReward = stage.rewardPerBlock;
+
+        uint256 userETH = b.userETH[msg.sender];
+        require(userETH > 0, "No participation in this block");
+
+        uint256 reward = totalReward * userETH / b.totalETH;
+        pendingRewards[msg.sender] += reward;
+
+        b.userETH[msg.sender] = 0;
+
+        emit RewardClaimed(msg.sender, reward);
+
+        b.rewardsClaimed = true;
+        mintedSupply += totalReward;
+
+        if(mintedSupply >= stage.endSupply && currentStage + 1 < stages.length){
+            currentStage++;
+        }
+    }
+
+    function claimPendingRewards() external whenNotPaused nonReentrant {
+        uint256 reward = pendingRewards[msg.sender];
+        require(reward > 0, "No pending rewards");
+
+        pendingRewards[msg.sender] = 0;
+        balanceOf[msg.sender] += reward;
+
+        totalSupply += reward;
+
+        emit Transfer(address(0), msg.sender, reward);
+    }
+
+    // ----------------------------
+    // Owner / Pausable / Emergency
+    // ----------------------------
+    function pause() external onlyOwner { paused = true; }
+    function unpause() external onlyOwner { paused = false; }
+
+    function emergencyWithdrawETH(address payable to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Zero address");
+        to.transfer(amount);
+    }
+
+    function emergencyWithdrawERC20(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Zero address");
+        IERC20(token).transfer(to, amount);
+    }
+
+    // ----------------------------
+    // Receive ETH
+    // ----------------------------
+    receive() external payable {}
+}
